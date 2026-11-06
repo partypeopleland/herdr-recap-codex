@@ -1,8 +1,9 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, terminals, hc, exec, theme, appHome } from "herdr";
+import { agents, panes, terminals, hc, exec, readTextFile, theme, appHome } from "herdr";
 
 const backend = `${appHome()}/mods/recap-codex/backend.ps1`;
+const remoteBackend = `${appHome()}/mods/recap-codex/remote.py`;
 const SNAPSHOT = "recap-codex-last-read-v3";
 const supportedAgents = new Set(["codex"]);
 const pad2 = (n) => String(n).padStart(2, "0");
@@ -18,6 +19,8 @@ export default class CodexRecap extends View {
   init(_props, cx) {
     this.info = {};
     this.pids = {};
+    this.remoteCards = [];
+    this.remoteScanned = false;
     this.busy = new Set();
     this.error = "";
     this.reading = false;
@@ -60,9 +63,17 @@ export default class CodexRecap extends View {
     localStorage.setItem(SNAPSHOT, JSON.stringify(saved));
   }
 
+  async remoteScript() {
+    if (!this.remoteScriptPromise) this.remoteScriptPromise = readTextFile(remoteBackend);
+    const source = await this.remoteScriptPromise;
+    if (!source) throw new Error("找不到遠端 Recap 後端");
+    return source;
+  }
+
   refresh(cx) {
     if (this.reading) return;
-    if (!this.busy.size && Date.now() - this.lastRead < 30000) return;
+    const hasRemote = panes().some((p) => p.terminal?.includes("/"));
+    if (!this.busy.size && Date.now() - this.lastRead < 30000 && (!hasRemote || this.remoteScanned)) return;
     this.reading = true;
     this.lastRead = Date.now();
     cx.spawn(async (cx) => {
@@ -84,6 +95,48 @@ export default class CodexRecap extends View {
             if (this.info[address].fresh || this.info[address].error) this.busy.delete(address);
           }
         }
+        const remotePanes = [...new Map(panes().filter((p) => p.terminal?.includes("/"))
+          .map((p) => [p.terminal, p])).values()];
+        const remote = await Promise.all(remotePanes.map(async (pane) => {
+          const machine = pane.terminal.split("/")[0];
+          const card = { address: pane.terminal, title: `${machine} · ${pane.title || pane.terminal}`,
+            app: "codex", machine };
+          try {
+            const response = await hc(["get", pane.terminal, "--json"]);
+            if (response.code !== 0) return { ...card, error: "遠端機器或終端機無法連線" };
+            const terminal = JSON.parse(response.stdout);
+            if (terminal.foreground?.name !== "codex" || !terminal.foreground.pid) return null;
+            return { ...card, pid: terminal.foreground.pid };
+          } catch { return { ...card, error: "遠端終端機資訊無法讀取" }; }
+        }));
+        this.remoteCards = remote.filter(Boolean);
+        this.remoteScanned = true;
+        for (const card of this.remoteCards.filter((card) => card.error)) {
+          this.info[card.address] = { error: card.error };
+          this.busy.delete(card.address);
+        }
+        const machines = [...new Set(this.remoteCards.filter((card) => card.pid).map((card) => card.machine))];
+        if (machines.length) {
+          const source = await this.remoteScript();
+          await Promise.all(machines.map(async (machine) => {
+            const cards = this.remoteCards.filter((card) => card.machine === machine && card.pid);
+            try {
+              const requests = cards.map((card) => ({ pid: card.pid }));
+              const response = await exec("python3", ["-c", source, "inspect", JSON.stringify(requests)], { on: machine });
+              if (response.code !== 0) throw new Error(response.stderr.trim() || response.stdout.trim());
+              const byPid = new Map(JSON.parse(response.stdout).map((entry) => [entry.pid, entry]));
+              for (const card of cards) {
+                this.info[card.address] = byPid.get(card.pid) ?? { error: "找不到遠端 session 資訊" };
+                if (this.info[card.address].fresh || this.info[card.address].error) this.busy.delete(card.address);
+              }
+            } catch (e) {
+              for (const card of cards) {
+                this.info[card.address] = { error: String(e?.message ?? e) };
+                this.busy.delete(card.address);
+              }
+            }
+          }));
+        }
         this.saveSnapshot(local, turnsAtStart);
         this.error = "";
       } catch (e) {
@@ -104,12 +157,22 @@ export default class CodexRecap extends View {
       try {
         const terminal = await hc(["get", address, "--json"]);
         if (terminal.code !== 0) throw new Error(terminal.stderr.trim() || "找不到 agent 終端");
-        const pid = JSON.parse(terminal.stdout).pid;
+        const details = JSON.parse(terminal.stdout);
+        const remote = address.includes("/");
+        const pid = remote ? details.foreground?.pid : details.pid;
         if (!pid) throw new Error("找不到 agent 行程");
-        const r = await exec("pwsh", ["-NoProfile", "-File", backend, "start", String(pid)]);
+        if (remote && details.foreground?.name !== "codex") throw new Error("遠端前景程式不是 Codex");
+        const r = remote
+          ? await exec("python3", ["-c", await this.remoteScript(), "start", String(pid)], { on: address.split("/")[0] })
+          : await exec("pwsh", ["-NoProfile", "-File", backend, "start", String(pid)]);
         if (r.code !== 0) throw new Error(r.stderr.trim() || r.stdout.trim());
         const outcome = JSON.parse(r.stdout);
         if (outcome.error) throw new Error(outcome.error);
+        if (remote && outcome.status === "ready") {
+          const started = await hc(["run", "--on", address.split("/")[0], "--bg", "--rm", "--no-parent", "--no-notify", "--",
+            "python3", "-c", await this.remoteScript(), "write", outcome.session, String(pid)]);
+          if (started.code !== 0) throw new Error(started.stderr.trim() || started.stdout.trim());
+        }
         if (outcome.status === "cached") this.busy.delete(address);
         this.refresh(cx);
       } catch (e) {
@@ -122,9 +185,10 @@ export default class CodexRecap extends View {
 
   render() {
     const t = theme();
-    const list = agents().filter((a) => supportedAgents.has(a.app) && !a.address.includes("/"));
+    const list = agents().filter((a) => supportedAgents.has(a.app) && !a.address.includes("/"))
+      .concat(this.remoteCards);
     const cards = list.map((a) => this.card(t, a));
-    if (!cards.length) cards.push(div().text_size(13).text_color(t.muted).child("目前沒有本機 Codex agent。"));
+    if (!cards.length) cards.push(div().text_size(13).text_color(t.muted).child("目前沒有 Codex 對話。"));
     return v_flex().id("codex-recap").w(760).h(560).bg(t.surface).p(18).gap(12)
       .child(h_flex().items_center().gap(12)
         .child(div().text_size(19).font_semibold().text_color(t.foreground).child("Recap"))
