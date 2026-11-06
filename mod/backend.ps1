@@ -8,6 +8,7 @@ $language = 'zh-TW'
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 $sessions = Join-Path $codexHome 'sessions'
 $cacheDir = Join-Path $env:LOCALAPPDATA 'HerdrRecapCodex\recaps'
+$processDir = Join-Path $env:LOCALAPPDATA 'HerdrRecapCodex\processes'
 $uuidPattern = '[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
 
 function Session-File([string]$id) {
@@ -24,7 +25,43 @@ function Read-FirstLine([string]$path) {
     } finally { $stream.Dispose() }
 }
 
+function Known-Session([int]$rootPid) {
+    $path = Join-Path $processDir "$rootPid.json"
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        $known = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        if ([string]$known.home -ine $codexHome -or [string]$known.id -notmatch "^$uuidPattern$") { return $null }
+        $root = Get-Process -Id $rootPid -ErrorAction Stop
+        $child = Get-Process -Id ([int]$known.childPid) -ErrorAction Stop
+        if ($root.StartTime.ToUniversalTime().Ticks -ne [long]$known.rootStarted -or
+            $child.StartTime.ToUniversalTime().Ticks -ne [long]$known.childStarted) { return $null }
+        $file = [IO.Path]::GetFullPath([string]$known.file)
+        $sessionRoot = [IO.Path]::GetFullPath($sessions).TrimEnd('\') + '\'
+        if (-not $file.StartsWith($sessionRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $file.EndsWith("-$($known.id).jsonl", [StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-Path -LiteralPath $file)) { return $null }
+        return [pscustomobject]@{ id = [string]$known.id; file = $file }
+    } catch { return $null }
+}
+
+function Save-KnownSession([int]$rootPid, $child, $session) {
+    try {
+        $root = Get-Process -Id $rootPid -ErrorAction Stop
+        $liveChild = Get-Process -Id ([int]$child.ProcessId) -ErrorAction Stop
+        New-Item -ItemType Directory -Force -Path $processDir | Out-Null
+        $data = @{
+            home = $codexHome; id = $session.id; file = $session.file
+            childPid = [int]$child.ProcessId
+            rootStarted = $root.StartTime.ToUniversalTime().Ticks
+            childStarted = $liveChild.StartTime.ToUniversalTime().Ticks
+        } | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText((Join-Path $processDir "$rootPid.json"), $data, [Text.UTF8Encoding]::new($false))
+    } catch { }
+}
+
 function Resolve-Session([int]$rootPid) {
+    $known = Known-Session $rootPid
+    if ($known) { return $known }
     $processes = @(Get-CimInstance Win32_Process)
     $queue = [System.Collections.Generic.Queue[int]]::new()
     $queue.Enqueue($rootPid)
@@ -69,6 +106,7 @@ function Resolve-Session([int]$rootPid) {
         } catch { continue }
     }
     if ($candidates.Count -ne 1) { throw "Cannot identify one Codex session for terminal $rootPid; found $($candidates.Count)" }
+    Save-KnownSession $rootPid $proc $candidates[0]
     return $candidates[0]
 }
 
@@ -81,13 +119,23 @@ function Cache-State($session) {
     if (Test-Path -LiteralPath $path) {
         try { $cache = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json } catch { $cache = $null }
     }
+    $atLocal = ''
+    $atUtc = ''
+    if ($cache -and $cache.at) {
+        try {
+            $at = if ($cache.at -is [datetime]) { $cache.at } else { [datetime]::Parse([string]$cache.at) }
+            $atLocal = $at.ToLocalTime().ToString('yyyy/MM/dd HH:mm')
+            $atUtc = $at.ToUniversalTime().ToString('o')
+        } catch { }
+    }
     $fresh = $null -ne $cache -and $cache.language -eq $language -and
         [long]$cache.size -eq $file.Length -and [long]$cache.mtime -eq $file.LastWriteTimeUtc.Ticks
     [pscustomobject]@{
         id = $session.id
         recap = if ($cache) { [string]$cache.recap } else { '' }
         fresh = [bool]$fresh
-        at = if ($cache) { [string]$cache.at } else { '' }
+        at = $atUtc
+        atLocal = $atLocal
     }
 }
 
@@ -152,7 +200,7 @@ try {
                     $session = Resolve-Session ([int]$pidText)
                     $state = Cache-State $session
                     $errorPath = Join-Path $cacheDir "$($session.id).error"
-                    $result += @{ pid = [int]$pidText; session = $state.id; recap = $state.recap; fresh = $state.fresh; at = $state.at; error = if (Test-Path -LiteralPath $errorPath) { Get-Content -LiteralPath $errorPath -Raw } else { '' } }
+                    $result += @{ pid = [int]$pidText; session = $state.id; recap = $state.recap; fresh = $state.fresh; at = $state.at; at_local = $state.atLocal; error = if (Test-Path -LiteralPath $errorPath) { Get-Content -LiteralPath $errorPath -Raw } else { '' } }
                 } catch { $result += @{ pid = [int]$pidText; error = $_.Exception.Message } }
             }
             ConvertTo-Json -InputObject @($result) -Compress -Depth 4
