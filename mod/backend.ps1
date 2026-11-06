@@ -125,7 +125,14 @@ function Write-Recap([string]$id) {
             [System.IO.File]::WriteAllText($tmpCache, $data, [System.Text.UTF8Encoding]::new($false))
             Move-Item -LiteralPath $tmpCache -Destination (Cache-Path $id) -Force
             Remove-Item -LiteralPath (Join-Path $cacheDir "$id.error") -ErrorAction SilentlyContinue
-        } finally { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally {
+            $resolved = [IO.Path]::GetFullPath($temp)
+            $tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
+            if ($resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -and
+                [IO.Path]::GetFileName($resolved) -like 'herdr-recap-codex-*') {
+                Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
     } catch {
         New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
         [System.IO.File]::WriteAllText((Join-Path $cacheDir "$id.error"), $_.Exception.Message)

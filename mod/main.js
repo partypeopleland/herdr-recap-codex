@@ -11,14 +11,17 @@ export default class CodexRecap extends View {
     this.busy = new Set();
     this.error = "";
     this.reading = false;
+    this.lastRead = 0;
     this.refresh(cx);
     // A poll only reads session metadata and cached summaries; it never runs Codex.
-    cx.timer.every(10000, (cx) => this.refresh(cx));
+    cx.timer.every(5000, (cx) => this.refresh(cx));
   }
 
   refresh(cx) {
     if (this.reading) return;
+    if (!this.busy.size && Date.now() - this.lastRead < 30000) return;
     this.reading = true;
+    this.lastRead = Date.now();
     cx.spawn(async (cx) => {
       try {
         const local = agents().filter((a) => a.app === "codex" && !a.address.includes("/"));
