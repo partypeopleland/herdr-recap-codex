@@ -7,7 +7,8 @@ This mod was informed by [mrolafsson/herdr-recap](https://github.com/mrolafsson/
 ## Behavior
 
 - Opening the popup, switching agents, and polling only inspect local Codex sessions and read cached recaps. They do not invoke the Codex CLI.
-- Pressing **產生／更新摘要** on an agent checks its cache. A fresh cache returns without model use. A missing or stale cache starts one `codex exec fork --ephemeral` request with a read-only sandbox.
+- Pressing an agent card's refresh icon checks its cache. A fresh cache returns without model use. A missing or stale cache starts one `codex exec fork --ephemeral` request with a read-only sandbox.
+- Each card shows its coding-agent tag and the local time of its cached recap. A green dot means the conversation changed after that recap was made.
 - Cache entries are keyed by Codex session ID, language, transcript size, and transcript modification time. A per-session mutex prevents concurrent duplicate generation.
 - The old recap remains visible when stale. Session lookup refuses ambiguous matches rather than showing another session's recap.
 - No automatic title suggestions are made.
